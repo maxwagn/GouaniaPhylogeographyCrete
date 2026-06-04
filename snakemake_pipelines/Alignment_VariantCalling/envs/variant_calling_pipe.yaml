@@ -1,0 +1,32 @@
+name: variant_calling_pipe
+
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # Core workflow
+  - python=3.10
+  - snakemake
+  - numpy=1.26
+  - pandas
+  - scipy
+  - pyyaml
+  - matplotlib
+  - pysam
+
+  # Variant calling / VCF tools
+  - bcftools
+  - samtools
+  - htslib
+  - bedtools
+  - vcftools
+  - bwa
+
+  # Optional but useful
+  - pyarrow
+  - pip
+
+  - pip:
+      - PyVCF3

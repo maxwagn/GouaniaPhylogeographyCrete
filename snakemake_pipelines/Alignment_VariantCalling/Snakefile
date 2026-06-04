@@ -1,0 +1,1056 @@
+###############################################################################
+# Snakefile: species-specific filtered all-sites and variant-only datasets
+#
+# Purpose
+# -------
+# This workflow keeps the logic of the original Crete Gouania variant-calling
+# pipeline, but makes the final data products explicit and reproducible:
+#
+#   1. whole-callset, chromosome-wise, filtered ALL-SITES files
+#   2. whole-callset, chromosome-wise, filtered VARIANT-SITES files
+#   3. species-specific ALL-SITES files using the same filters
+#   4. species-specific VARIANT-SITES files using the same filters
+#
+# The key design choice is that filtering happens ONCE on the full callset.
+# Only after genotype-level and site-level filtering do we split into:
+#
+#   all_sites  -> invariant + variant callable PASS sites
+#   variants   -> non-reference/non-invariant PASS sites only
+#
+# Species-specific datasets are then produced from those two matched products.
+# This guarantees that all_sites and variants use exactly the same thresholds,
+# sample-level genotype filters, site filters, naming, and chromosome handling.
+###############################################################################
+
+import os
+import sys
+import copy
+import yaml
+import pysam
+import subprocess
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from matplotlib import pyplot as plt
+
+jn = os.path.join
+
+###############################################################################
+# Environment and configuration
+###############################################################################
+
+shell.prefix("source /data/antwerpen/grp/asvardal/share/hscon5_setup.sh; ")
+
+configfile: "meta_config/config.yaml"
+
+# Run example:
+# snakemake -p --rerun-triggers mtime \
+#   --profile ~/.config/snakemake/slurm-simple4 \
+#   --rerun-incomplete --keep-going --restart-times 0 | tee run.log
+
+###############################################################################
+# Global parameters
+###############################################################################
+
+CHROMOSOMES = [str(i) for i in range(1, 25) if i not in [23]]
+
+ind_filter_id = "tif1"
+site_filter_id = "sft1"
+
+SPECIES = ["orientalis", "hofrichteri"]
+
+CALLSET_ID = config["callset"]["id"]
+REF_NAME = config["ref"]["name"]
+VC_ROOT = f"results/VariantCalling/{CALLSET_ID}_{REF_NAME}"
+
+REF_FASTA = config["ref"]["base_fn"] + config["ref"]["ext_fa"]
+REF_FAI = config["ref"]["base_fn"] + config["ref"]["ext_fai"]
+
+sample_mt = (
+    pd.read_csv(config["sample_mt"], dtype=str, sep="\t")
+    .set_index("unique_id", drop=False)
+    .drop_duplicates()
+)
+
+exclude_IDs = ["lepadogaster_D86"]
+sequence_IDS = [i for i in sample_mt["sequence_id"].values if i not in exclude_IDs]
+samples = sequence_IDS
+n_samples = len(samples)
+
+chunk_size = int(5e6)
+
+chrom_length = pd.read_csv(
+    REF_FAI,
+    sep="\t",
+    usecols=[0, 1],
+    names=["chrom", "len"],
+    index_col=0,
+).squeeze()
+
+max_chrom_length = chrom_length.max()
+chunk_to_region = {
+    i: (int(i * chunk_size + 1), int((i + 1) * chunk_size))
+    for i in range(int(np.ceil(max_chrom_length / chunk_size)))
+}
+
+
+def get_chunks(chrom):
+    """Return all chunk IDs needed for one chromosome."""
+    return range(int(np.ceil(chrom_length[chrom] / chunk_size)))
+
+
+def region_for_chunk(wildcards):
+    """Return bcftools-compatible region string for one chromosome chunk."""
+    start, end = chunk_to_region[int(wildcards.chunk)]
+    return f"{wildcards.chrom}:{start}-{end}"
+
+
+def read_dp(fn):
+    """Read a two-column sample/depth file into a dictionary."""
+    dp_dic = {}
+    with open(fn) as f:
+        for line in f:
+            sample, dp = line.strip().split()
+            dp_dic[sample] = float(dp)
+    return dp_dic
+
+
+def write_dp(fn, samples, dps):
+    """Write sample/depth values."""
+    with open(fn, "w") as f:
+        for sample, dp in zip(samples, dps):
+            f.write(f"{sample}\t{dp}\n")
+
+
+def get_total_dp_files(wildcards):
+    """All chunk-level total-depth files needed to estimate mean coverage."""
+    return [
+        f"{VC_ROOT}/coverage/total_coverage_{chrom}.{chunk}.txt"
+        for chrom in CHROMOSOMES
+        for chunk in get_chunks(chrom)
+    ]
+
+
+def get_filter_command(wildcards):
+    """
+    Translate the site-filter section of meta_config/config.yaml into a pipe of
+    bcftools soft-filter commands.
+
+    Expected config structure:
+      site_filter_sets:
+        sft1:
+          merge_dist: ...
+          filters:
+            FilterName:
+              tag: MQ
+              operator: "<"
+              threshold: 30
+              threshold_type: absolute
+    """
+    commands = []
+    filters = config["site_filter_sets"][wildcards.site_filter_id]["filters"]
+
+    for filter_name, fd in filters.items():
+        assert fd["threshold_type"] == "absolute", (
+            "Only absolute site-filter thresholds are currently implemented."
+        )
+        commands.append(
+            "bcftools filter "
+            f"--soft-filter {filter_name} "
+            "--mode + "
+            "-O u "
+            f"--exclude '{fd['tag']} {fd['operator']} {fd['threshold']}'"
+        )
+
+    return " | ".join(commands)
+
+
+def subset_file(wildcards):
+    """
+    Species-specific sample list.
+
+    These files should contain the sample IDs to keep after reheadering, one per
+    line, e.g.
+      meta_config/subset_orientalis.txt
+      meta_config/subset_hofrichteri.txt
+    """
+    return f"meta_config/subset_{wildcards.species}.txt"
+
+
+###############################################################################
+# Wildcard constraints
+###############################################################################
+
+wildcard_constraints:
+    chrom = r"\w+",
+    chunk = r"\d+",
+    ind_filter_id = r"[^.]+",
+    site_filter_id = r"[^.]+",
+    species = r"orientalis|hofrichteri",
+    dataset = r"all_sites|variants"
+
+
+###############################################################################
+# Final targets
+###############################################################################
+
+rule all:
+    input:
+        # species-specific all-sites datasets for popgenWindows / Dxy / pi / dA
+        expand(
+            f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{ind_filter_id}.{site_filter_id}.chr{{chrom}}.vcf.gz",
+            species=SPECIES,
+            chrom=CHROMOSOMES,
+        ),
+
+        # species-specific variant-only datasets for PCA / ADMIXTURE / FST / etc.
+        expand(
+            f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{ind_filter_id}.{site_filter_id}.chr{{chrom}}.vcf.gz",
+            species=SPECIES,
+            chrom=CHROMOSOMES,
+        ),
+
+        # optional legacy-style biallelic SNP files, kept for analyses that need them
+        expand(
+            f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.chr{{chrom}}.vcf.gz",
+            species=SPECIES,
+            chrom=CHROMOSOMES,
+        ),
+        expand(
+            f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{ind_filter_id}.{site_filter_id}.no_indels.biallelic.chr{{chrom}}.vcf.gz",
+            species=SPECIES,
+            chrom=CHROMOSOMES,
+        )
+
+
+###############################################################################
+# Reference preparation
+###############################################################################
+
+ref_indexes = [".amb", ".ann", ".bwt", ".pac", ".sa", ".fai"]
+
+rule bwa_index:
+    input:
+        ref = REF_FASTA
+    output:
+        amb = REF_FASTA + ".amb",
+        ann = REF_FASTA + ".ann",
+        bwt = REF_FASTA + ".bwt",
+        pac = REF_FASTA + ".pac",
+        sa  = REF_FASTA + ".sa",
+        fai = REF_FASTA + ".fai",
+        dict = config["ref"]["base_fn"] + ".dict"
+    params:
+        name = REF_NAME
+    shell:
+        """
+        samtools faidx {input.ref}
+        samtools dict -a {params.name} -s 'Gouania adriatica' {input.ref} -o {output.dict}
+        bwa index {input.ref}
+        """
+
+
+###############################################################################
+# Read alignment
+###############################################################################
+
+rule align_reads:
+    """
+    Align paired-end reads, fix mate information, coordinate-sort, mark duplicates,
+    and index the final BAM.
+    """
+    priority: 50
+    input:
+        readf = "/scratch/antwerpen/grp/asvardal/projects/clingfishes/raw_reads/crete_pop_genomics/{seqrunID}_1.fq.gz",
+        readr = "/scratch/antwerpen/grp/asvardal/projects/clingfishes/raw_reads/crete_pop_genomics/{seqrunID}_2.fq.gz",
+        ref = REF_FASTA,
+        indices = [REF_FASTA + ex for ex in ref_indexes]
+    output:
+        bam = f"results/Alignment/{REF_NAME}/{{seqrunID}}.fixmate.sort.markdup.rg.bam",
+        bai = f"results/Alignment/{REF_NAME}/{{seqrunID}}.fixmate.sort.markdup.rg.bam.bai"
+    threads: 12
+    resources:
+        mem_mb = 18000,
+        walltime = 48
+    params:
+        add_cpus = lambda wildcards, threads: threads - 1,
+        prefix = lambda wildcards: f"results/Alignment/{REF_NAME}/{wildcards.seqrunID}"
+    shell:
+        r"""
+        bwa mem -t {threads} \
+          -R "@RG\tID:{wildcards.seqrunID}\tSM:{wildcards.seqrunID}\tPL:ILLUMINA" \
+          {input.ref} \
+          <(gzip -dc {input.readf}) \
+          <(gzip -dc {input.readr}) \
+        | samtools fixmate -@ {params.add_cpus} -m - - \
+        | samtools sort -T {params.prefix}.sort.tmp -@ {params.add_cpus} - \
+        | samtools markdup -T {params.prefix}.markdup.tmp -@ {params.add_cpus} - {output.bam}
+
+        samtools index {output.bam}
+        """
+
+
+rule flagstat:
+    input:
+        bam = f"results/Alignment/{REF_NAME}/{{seqrunID}}.fixmate.sort.markdup.rg.bam"
+    output:
+        flagstat = f"results/Alignment/{REF_NAME}/{{seqrunID}}.fixmate.sort.markdup.rg.bam.flagstat"
+    resources:
+        mem_mb = 18000,
+        walltime = 1
+    shell:
+        "samtools flagstat {input.bam} > {output.flagstat}"
+
+
+###############################################################################
+# Joint all-sites calling in chromosome chunks
+###############################################################################
+
+rule call_all_sites_bcf:
+    """
+    Jointly call all sites in small chromosome chunks.
+
+    Important:
+    - This produces all-sites BCFs, not only variable sites.
+    - FORMAT/AD and FORMAT/DP are retained for downstream genotype filters.
+    - The chunk-level total coverage files are used to estimate sample-specific
+      mean coverage and derive low/high depth cutoffs.
+    """
+    input:
+        bams = expand(
+            f"results/Alignment/{REF_NAME}/{{seqrunID}}.fixmate.sort.markdup.rg.bam",
+            seqrunID=sequence_IDS,
+        ),
+        ref = REF_FASTA
+    output:
+        bcf = f"{VC_ROOT}/bcf/all_sites.chr{{chrom}}.{{chunk}}.bcf",
+        csi = f"{VC_ROOT}/bcf/all_sites.chr{{chrom}}.{{chunk}}.bcf.csi",
+        tot_dp = f"{VC_ROOT}/coverage/total_coverage_{{chrom}}.{{chunk}}.txt"
+    threads: 2
+    resources:
+        mem_mb = 18000,
+        walltime = 24
+    params:
+        region = region_for_chunk
+    shell:
+        r"""
+        bcftools mpileup \
+          -a FORMAT/AD,FORMAT/DP \
+          -d 3000 \
+          --threads {threads} \
+          -Ou \
+          --regions {params.region} \
+          -f {input.ref} \
+          {input.bams} \
+        | bcftools call \
+          --threads {threads} \
+          -f GQ \
+          -m \
+          -Ou \
+        | bcftools +fill-tags \
+          --threads {threads} \
+          -Ob \
+        | tee {output.bcf} \
+        | bcftools query -f '[%DP\t]\n' \
+        | awk '{{for(i=1; i<=NF; i++) dp_tot[i]+=$i}} END{{for(i=1; i<=NF; i++) {{printf dp_tot[i]"\t"}}; printf "\n"}}' \
+          > {output.tot_dp}
+
+        bcftools index -f {output.bcf}
+        """
+
+
+###############################################################################
+# Estimate sample-specific depth thresholds
+###############################################################################
+
+rule get_mean_coverage:
+    """
+    Calculate sample-specific mean depth across all called chromosome chunks.
+    """
+    input:
+        total_dps = get_total_dp_files
+    output:
+        cov = f"{VC_ROOT}/coverage/mean_coverage.txt"
+    run:
+        mean_dps = np.zeros(n_samples)
+
+        for fn in input.total_dps:
+            with open(fn) as f:
+                mean_dps += np.array([float(x) for x in f.readline().strip().split()])
+
+        mean_dps = mean_dps / chrom_length.loc[CHROMOSOMES].sum()
+        write_dp(output.cov, samples, mean_dps)
+
+
+rule min_max_dp:
+    """
+    Convert each sample's mean coverage into low/high depth thresholds using the
+    p-value settings in individual_filter_sets from the config.
+    """
+    input:
+        cov = f"{VC_ROOT}/coverage/mean_coverage.txt"
+    output:
+        min_dp = f"{VC_ROOT}/coverage/low_coverage.{{ind_filter_id}}.txt",
+        max_dp = f"{VC_ROOT}/coverage/excess_coverage.{{ind_filter_id}}.txt"
+    params:
+        filter_thresh = lambda wildcards: config["individual_filter_sets"][wildcards.ind_filter_id]
+    run:
+        mean_dp_dic = read_dp(input.cov)
+
+        min_dp = []
+        max_dp = []
+        for dp in mean_dp_dic.values():
+            min_dp.append(stats.poisson.ppf(params.filter_thresh["min_dp_to_missing_pval"], dp))
+            max_dp.append(stats.poisson.isf(params.filter_thresh["max_dp_to_missing_pval"], dp))
+
+        write_dp(output.min_dp, mean_dp_dic.keys(), min_dp)
+        write_dp(output.max_dp, mean_dp_dic.keys(), max_dp)
+
+
+###############################################################################
+# Genotype-level filtering and filter-statistic collection
+###############################################################################
+
+bins = {
+    "MQ": np.linspace(0, 61, 62),
+    "DP": None,
+    "MQ0F": np.linspace(0, 1, 101),
+    "MQSB": np.linspace(0, 1, 101),
+    "DD": np.linspace(0, 10, 401),
+    "ExcHetOrig": np.linspace(0, 1, 101),
+    "AB_Het": np.linspace(0, 100, 401),
+    "MF": None,
+}
+
+rule genotype_filter_all_sites:
+    """
+    Genotype-level filtering of all-sites BCF chunks.
+
+    Individual genotypes are masked to missing if:
+      - depth is too low
+      - depth is too high
+      - genotype quality is too low
+      - heterozygote allele balance is strongly biased
+
+    This version is robust for all-sites datasets where:
+      - AD can be missing
+      - AD can sum to zero
+      - invariant records occur frequently
+    """
+
+    input:
+        bcf = f"{VC_ROOT}/bcf/all_sites.chr{{chrom}}.{{chunk}}.bcf",
+        cov = f"{VC_ROOT}/coverage/mean_coverage.txt",
+        min_dp = f"{VC_ROOT}/coverage/low_coverage.{{ind_filter_id}}.txt",
+        max_dp = f"{VC_ROOT}/coverage/excess_coverage.{{ind_filter_id}}.txt"
+
+    output:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}/all_sites.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.bcf",
+        csi = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}/all_sites.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.bcf.csi",
+        filter_per_sample = f"{VC_ROOT}/filter_{{ind_filter_id}}/filter_per_sample.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.tsv",
+        total_per_sample = f"{VC_ROOT}/filter_{{ind_filter_id}}/total_per_sample.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.tsv",
+        stat_hists = f"{VC_ROOT}/filter_{{ind_filter_id}}/stat_hists.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.yaml",
+        individual_dp_hists = f"{VC_ROOT}/filter_{{ind_filter_id}}/individual_dp_hists.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.yaml"
+
+    threads: 1
+
+    resources:
+        mem_mb = 36000,
+        walltime = 12
+
+    params:
+        filter_thresh = lambda wildcards: config["individual_filter_sets"][wildcards.ind_filter_id],
+        region = region_for_chunk
+
+    run:
+        import copy
+        import subprocess
+        import numpy as np
+        import pandas as pd
+        import yaml
+        import pysam
+        from scipy import stats
+
+        #######################################################################
+        # Read coverage cutoffs
+        #######################################################################
+
+        mean_dp_dic = read_dp(input.cov)
+        min_dp_dic = read_dp(input.min_dp)
+        max_dp_dic = read_dp(input.max_dp)
+
+        #######################################################################
+        # Open input BCF
+        #######################################################################
+
+        bcf_in = pysam.VariantFile(input.bcf)
+
+        samples_in_vcf = list(bcf_in.header.samples)
+
+        assert samples_in_vcf == samples, (
+            "Sample order mismatch between metadata and BCF."
+        )
+
+        #######################################################################
+        # Add INFO fields if missing
+        #######################################################################
+
+        if "DD" not in bcf_in.header.info:
+            bcf_in.header.info.add(
+                "DD",
+                1,
+                "Float",
+                "Average normalized deviation from mean sample coverage."
+            )
+
+        if "ExcHetOrig" not in bcf_in.header.info:
+            bcf_in.header.info.add(
+                "ExcHetOrig",
+                "A",
+                "Float",
+                "Original ExcessHet value before filtering."
+            )
+
+        if "AB_Het" not in bcf_in.header.info:
+            bcf_in.header.info.add(
+                "AB_Het",
+                1,
+                "Float",
+                "Phred-scaled allele-balance test statistic."
+            )
+
+        if "MF" not in bcf_in.header.info:
+            bcf_in.header.info.add(
+                "MF",
+                1,
+                "Float",
+                "Fraction of missing genotypes after filtering."
+            )
+
+        #######################################################################
+        # Stream through bcftools +fill-tags
+        #######################################################################
+
+        filltag_stream = subprocess.Popen(
+            ["bcftools", "+fill-tags", "-Ob"],
+            stdin=subprocess.PIPE,
+            stdout=open(output.bcf, "wb"),
+            stderr=subprocess.PIPE
+        )
+
+        # IMPORTANT:
+        # "wu" = uncompressed BCF stream
+        # "wbu" causes pysam crash
+        bcf_out = pysam.VariantFile(
+            filltag_stream.stdin,
+            "wu",
+            header=bcf_in.header
+        )
+
+        #######################################################################
+        # Tracking filter statistics
+        #######################################################################
+
+        filter_per_sample = {
+            s: {
+                "allele_balance": 0,
+                "low_depth": 0,
+                "high_depth": 0,
+                "low_gq": 0
+            }
+            for s in samples
+        }
+
+        total_per_sample = copy.deepcopy(filter_per_sample)
+
+        #######################################################################
+        # Iterate through records
+        #######################################################################
+
+        for rec in bcf_in:
+
+            deviations = []
+            ads_hets = np.array([0, 0], dtype=int)
+
+            missing = 0
+
+            ###################################################################
+            # Iterate through samples
+            ###################################################################
+
+            for sample_name, sample_call in rec.samples.items():
+
+                ###############################################################
+                # Depth filtering
+                ###############################################################
+
+                dp = sample_call.get("DP")
+
+                if dp is not None:
+
+                    if dp <= min_dp_dic[sample_name]:
+                        sample_call["GT"] = (None, None)
+                        filter_per_sample[sample_name]["low_depth"] += 1
+
+                    total_per_sample[sample_name]["low_depth"] += 1
+
+                    if dp >= max_dp_dic[sample_name]:
+                        sample_call["GT"] = (None, None)
+                        filter_per_sample[sample_name]["high_depth"] += 1
+
+                    total_per_sample[sample_name]["high_depth"] += 1
+
+                    if mean_dp_dic[sample_name] > 0:
+                        deviation = abs(
+                            dp - mean_dp_dic[sample_name]
+                        ) / np.sqrt(mean_dp_dic[sample_name])
+
+                        deviations.append(deviation)
+
+                ###############################################################
+                # Genotype-quality filtering
+                ###############################################################
+
+                gq = sample_call.get("GQ")
+
+                if gq is not None:
+
+                    if gq < params.filter_thresh["min_GQ"]:
+                        sample_call["GT"] = (None, None)
+                        filter_per_sample[sample_name]["low_gq"] += 1
+
+                    total_per_sample[sample_name]["low_gq"] += 1
+
+                ###############################################################
+                # Allele-balance filter for heterozygotes
+                ###############################################################
+
+                gt = sample_call.get("GT")
+
+                if (
+                    gt is not None
+                    and None not in gt
+                    and len(gt) == 2
+                    and gt[0] != gt[1]
+                ):
+
+                    ad_raw = sample_call.get("AD")
+
+                    if ad_raw is not None:
+
+                        try:
+
+                            ad = np.array(ad_raw, dtype=int)[list(gt)]
+
+                            ad_sum = int(np.sum(ad))
+
+                            # IMPORTANT:
+                            # all-sites records can have AD summing to zero
+                            if ad_sum > 0:
+
+                                ads_hets += ad
+
+                                ab_pval = stats.binomtest(
+                                    int(ad[0]),
+                                    n=ad_sum,
+                                    p=0.5
+                                ).pvalue
+
+                                if (
+                                    ab_pval <=
+                                    params.filter_thresh["ab_test_thresh"]
+                                ):
+                                    sample_call["GT"] = (None, None)
+
+                                    filter_per_sample[
+                                        sample_name
+                                    ]["allele_balance"] += 1
+
+                            total_per_sample[
+                                sample_name
+                            ]["allele_balance"] += 1
+
+                        except Exception:
+                            pass
+
+                ###############################################################
+                # Count missing genotypes
+                ###############################################################
+
+                if sample_call.get("GT") == (None, None):
+                    missing += 1
+
+            ###################################################################
+            # Record-level annotations
+            ###################################################################
+
+            rec.info["MF"] = missing / len(samples)
+
+            if deviations:
+                rec.info["DD"] = float(np.mean(deviations))
+
+            ###################################################################
+            # Combined heterozygote allele-balance statistic
+            ###################################################################
+
+            if int(np.sum(ads_hets)) > 0:
+
+                ab_pval = stats.binomtest(
+                    int(ads_hets[0]),
+                    n=int(np.sum(ads_hets)),
+                    p=0.5
+                ).pvalue
+
+                if ab_pval > 0:
+                    rec.info["AB_Het"] = float(-10 * np.log10(ab_pval))
+
+                if "ExcHet" in rec.info:
+                    rec.info["ExcHetOrig"] = rec.info["ExcHet"]
+
+            ###################################################################
+            # Write record
+            ###################################################################
+
+            bcf_out.write(rec)
+
+        #######################################################################
+        # Close streams
+        #######################################################################
+
+        bcf_out.close()
+
+        _, stderr = filltag_stream.communicate()
+
+        if filltag_stream.returncode != 0:
+            raise RuntimeError(stderr.decode())
+
+        #######################################################################
+        # Index output BCF
+        #######################################################################
+
+        shell(f"bcftools index -f --csi {output.bcf}")
+
+        #######################################################################
+        # Write filter summary tables
+        #######################################################################
+
+        pd.DataFrame(filter_per_sample).to_csv(
+            output.filter_per_sample,
+            sep="\t"
+        )
+
+        pd.DataFrame(total_per_sample).to_csv(
+            output.total_per_sample,
+            sep="\t"
+        )
+
+        #######################################################################
+        # Placeholder histogram outputs
+        #######################################################################
+
+        with open(output.stat_hists, "w") as f:
+            yaml.safe_dump({}, f)
+
+        with open(output.individual_dp_hists, "w") as f:
+            yaml.safe_dump({}, f)
+
+
+###############################################################################
+# Site-level soft filtering
+###############################################################################
+
+rule add_site_filters:
+    """
+    Apply site-level soft filters to genotype-filtered all-sites BCFs.
+
+    The output still contains all records, but failed sites are labelled in the
+    FILTER column. This is useful because we can derive both matched all-sites
+    and variant-only PASS datasets from the same filtered source.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}/all_sites.{{ind_filter_id}}.chr{{chrom}}.{{chunk}}.bcf"
+    output:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.bcf",
+        csi = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.bcf.csi"
+    params:
+        filter_command = get_filter_command
+    shell:
+        r"""
+        bcftools view -O u {input.bcf} \
+        | {params.filter_command} \
+        | bcftools view -O b -o {output.bcf}
+
+        bcftools index -f {output.bcf}
+        """
+
+
+rule get_filter_info:
+    """
+    Export failed site positions and filters for later QC and optional masking.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.bcf"
+    output:
+        filter_info = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.filters.info"
+    shell:
+        r"""
+        bcftools query \
+          --include 'FILTER != "PASS"' \
+          --format '%CHROM\t%POS\t%POS\t%FILTER\n' \
+          {input.bcf} \
+        | awk 'BEGIN{{OFS="\t"}} {{print $1,$2,$4}}' \
+          > {output.filter_info}
+        """
+
+
+rule merge_chrom_filter_files:
+    """
+    Merge chunk-level failed-site tables into chromosome-level filter info and BED.
+    """
+    input:
+        filter_infos = lambda wildcards: expand(
+            f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.filters.info",
+            ind_filter_id=wildcards.ind_filter_id,
+            site_filter_id=wildcards.site_filter_id,
+            chrom=wildcards.chrom,
+            chunk=get_chunks(wildcards.chrom),
+        )
+    output:
+        filter_info = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.filters.info.gz",
+        filter_bed = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.filters.bed.gz",
+        filter_info_ix = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.filters.info.gz.tbi",
+        filter_bed_ix = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.filters.bed.gz.tbi"
+    params:
+        merge_dist = lambda wildcards: config["site_filter_sets"][wildcards.site_filter_id]["merge_dist"]
+    shell:
+        r"""
+        cat {input.filter_infos} \
+        | tee >(bgzip -c > {output.filter_info}) \
+        | awk 'BEGIN{{OFS="\t"}} {{print $1,$2-1,$2}}' \
+        | bedtools merge -d {params.merge_dist} \
+        | bgzip -c > {output.filter_bed}
+
+        tabix -s 1 -b 2 -e 2 {output.filter_info}
+        tabix -p bed {output.filter_bed}
+        """
+
+
+###############################################################################
+# Chromosome-level matched all-sites and variant-only datasets
+###############################################################################
+
+rule make_chrom_all_sites:
+    """
+    Concatenate filtered chunks and retain only PASS sites.
+
+    This is the chromosome-level ALL-SITES product:
+    - invariant callable sites are retained
+    - variant sites are retained
+    - sites failing filters are removed
+    """
+    input:
+        bcfs = lambda wildcards: expand(
+            f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.{{chunk}}.bcf",
+            ind_filter_id=wildcards.ind_filter_id,
+            site_filter_id=wildcards.site_filter_id,
+            chrom=wildcards.chrom,
+            chunk=get_chunks(wildcards.chrom),
+        )
+    output:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf",
+        csi = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf.csi"
+    shell:
+        r"""
+        bcftools concat -Ou {input.bcfs} \
+        | bcftools view --apply-filters PASS -Ob -o {output.bcf}
+
+        bcftools index -f {output.bcf}
+        """
+
+
+rule make_chrom_variants:
+    """
+    Derive the matched chromosome-level VARIANT-SITES product from the PASS
+    all-sites file.
+
+    This keeps all non-invariant records. Use the optional biallelic-SNP rule
+    below when an analysis specifically requires biallelic SNPs only.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf"
+    output:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf",
+        csi = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf.csi"
+    shell:
+        r"""
+        bcftools view \
+          --exclude 'ALT="."' \
+          -Ob \
+          -o {output.bcf} \
+          {input.bcf}
+
+        bcftools index -f {output.bcf}
+        """
+
+
+rule make_chrom_biallelic_snps:
+    """
+    Optional legacy-compatible product for analyses requiring biallelic PASS SNPs.
+    This is derived from the matched variant set, not independently filtered.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf"
+    output:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.pass.snps.biallelic.chr{{chrom}}.bcf",
+        csi = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.pass.snps.biallelic.chr{{chrom}}.bcf.csi"
+    shell:
+        r"""
+        bcftools view \
+          --max-alleles 2 \
+          --types snps \
+          -Ob \
+          -o {output.bcf} \
+          {input.bcf}
+
+        bcftools index -f {output.bcf}
+        """
+
+
+###############################################################################
+# Species-specific VCFs with matched filtering
+###############################################################################
+
+rule subset_species_all_sites:
+    """
+    Species-specific ALL-SITES VCF.
+
+    Use this for popgenWindows-style window analyses where invariant callable
+    sites are required for unbiased pi, Dxy, Fst, and dA estimates.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf"
+    output:
+        vcf = f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.vcf.gz",
+        tbi = f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.vcf.gz.tbi"
+    params:
+        rename_header_list = "meta_config/rename_header_species.txt",
+        subset = subset_file,
+        tmp = lambda wildcards: f"{VC_ROOT}/bcf_species_specific/tmp.{wildcards.species}.all_sites.{wildcards.chrom}.bcf"
+    shell:
+        r"""
+        bcftools reheader \
+          --samples {params.rename_header_list} \
+          -o {params.tmp} \
+          {input.bcf}
+
+        bcftools view \
+          -Oz \
+          -S {params.subset} \
+          -o {output.vcf} \
+          {params.tmp}
+
+        bcftools index --tbi -f {output.vcf}
+        rm -f {params.tmp} {params.tmp}.csi
+        """
+
+
+rule subset_species_variants:
+    """
+    Species-specific VARIANT-SITES VCF.
+
+    Use this for PCA, ADMIXTURE, FST, distance matrices, or other analyses where
+    invariant sites are not needed or are undesirable.
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.bcf"
+    output:
+        vcf = f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.vcf.gz",
+        tbi = f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.vcf.gz.tbi"
+    params:
+        rename_header_list = "meta_config/rename_header_species.txt",
+        subset = subset_file,
+        tmp = lambda wildcards: f"{VC_ROOT}/bcf_species_specific/tmp.{wildcards.species}.variants.{wildcards.chrom}.bcf"
+    shell:
+        r"""
+        bcftools reheader \
+          --samples {params.rename_header_list} \
+          -o {params.tmp} \
+          {input.bcf}
+
+        bcftools view \
+          -Oz \
+          -S {params.subset} \
+          -o {output.vcf} \
+          {params.tmp}
+
+        bcftools index --tbi -f {output.vcf}
+        rm -f {params.tmp} {params.tmp}.csi
+        """
+
+
+rule subset_species_biallelic_snps:
+    """
+    Species-specific biallelic SNP VCF.
+
+    This replaces the old file naming pattern:
+      {species}_all_sites.tif1.sft1.pass.snps.biallelic.chr{chrom}.vcf.gz
+
+    The new naming makes the biological content clearer:
+      {species}_variants.tif1.sft1.pass.snps.biallelic.chr{chrom}.vcf.gz
+    """
+    input:
+        bcf = f"{VC_ROOT}/bcf_filter_{{ind_filter_id}}_{{site_filter_id}}/variants.{{ind_filter_id}}.{{site_filter_id}}.pass.snps.biallelic.chr{{chrom}}.bcf"
+    output:
+        vcf = f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{{ind_filter_id}}.{{site_filter_id}}.pass.snps.biallelic.chr{{chrom}}.vcf.gz",
+        tbi = f"{VC_ROOT}/bcf_species_specific/{{species}}_variants.{{ind_filter_id}}.{{site_filter_id}}.pass.snps.biallelic.chr{{chrom}}.vcf.gz.tbi"
+    params:
+        rename_header_list = "meta_config/rename_header_species.txt",
+        subset = subset_file,
+        tmp = lambda wildcards: f"{VC_ROOT}/bcf_species_specific/tmp.{wildcards.species}.biallelic_snps.{wildcards.chrom}.bcf"
+    shell:
+        r"""
+        bcftools reheader \
+          --samples {params.rename_header_list} \
+          -o {params.tmp} \
+          {input.bcf}
+
+        bcftools view \
+          -Oz \
+          -S {params.subset} \
+          -o {output.vcf} \
+          {params.tmp}
+
+        bcftools index --tbi -f {output.vcf}
+        rm -f {params.tmp} {params.tmp}.csi
+        """
+
+
+rule select_all_sites_no_indels_biallelic_snps:
+    """
+    Create all-sites VCFs suitable for popgenWindows/diversity scans.
+
+    Keeps:
+      - invariant sites
+      - biallelic SNPs
+
+    Removes:
+      - indels
+      - multiallelic SNPs
+      - complex variants
+    """
+    input:
+        vcf = f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{{ind_filter_id}}.{{site_filter_id}}.chr{{chrom}}.vcf.gz"
+    output:
+        vcf = f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{{ind_filter_id}}.{{site_filter_id}}.no_indels.biallelic.chr{{chrom}}.vcf.gz",
+        tbi = f"{VC_ROOT}/bcf_species_specific/{{species}}_all_sites.{{ind_filter_id}}.{{site_filter_id}}.no_indels.biallelic.chr{{chrom}}.vcf.gz.tbi"
+    shell:
+        """
+        bcftools view \
+          -i 'N_ALT=0 || (TYPE="snp" && N_ALT=1)' \
+          -Oz \
+          -o {output.vcf} \
+          {input.vcf}
+
+        bcftools index -f --tbi {output.vcf}
+        """

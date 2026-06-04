@@ -1,0 +1,1082 @@
+###############################################################################
+# Crete Gouania population genomics workflow
+# Clean publication rerun version
+###############################################################################
+
+configfile: "config/config.yaml"
+
+import os
+import sys
+import re
+import subprocess
+
+import numpy as np
+import pandas as pd
+
+sys.path.append("/data/antwerpen/grp/asvardal/hs_tools")
+from pypopgen3.modules import diversity as dv
+
+
+###############################################################################
+# Configuration
+###############################################################################
+
+REFERENCE_FAI = config["reference"]["fai"]
+VCF_DIR = config["input_vcfs"]["dir"]
+
+SNP_SUFFIX = config["input_vcfs"]["snp_suffix"]
+VARIANT_SUFFIX = config["input_vcfs"]["variant_suffix"]
+ALLSITES_SUFFIX = config["input_vcfs"]["allsites_suffix"]
+SNP_INDEL_SUFFIX = "variants.tif1.sft1.snps_indels.biallelic"
+
+SPECIES = config["species"]
+CHROMOSOMES = config["chromosomes"]
+
+WINDOW_SIZE = config["window"]["size"]
+WINDOW_STEP = config["window"]["step"]
+WINDOW_MIN_SITES = config["window"]["min_sites"]
+
+MAF = config["maf"]
+CLUSTERS = config["admixture_clusters"]
+CRETEONLY_CLUSTERS = [2, 3, 4]
+POPS = config["populations"]
+
+chrom_length = pd.read_csv(
+    REFERENCE_FAI,
+    sep="\t",
+    usecols=[0, 1],
+    names=["chrom", "len"],
+    index_col=0,
+).squeeze()
+
+
+def pop_info(species):
+    return f"input_files/pop_info/{species}_pop.no_outgroup.info"
+#    return f"input_files/pop_info/{species}_pop.info"
+
+
+def pop_af_info(species):
+    return f"input_files/pop_info/{species}_popAF.info"
+
+
+def generate_population_string(wildcards):
+    popmap = pop_info(wildcards.species)
+    pops = []
+    with open(popmap) as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.strip().split()
+            if len(fields) >= 2:
+                pops.append(fields[1])
+    return " ".join(f"-p {p}" for p in sorted(set(pops)))
+
+
+###############################################################################
+# Final targets
+###############################################################################
+
+rule all:
+    input:
+        # Genome-wide annotated allele-frequency tables
+        expand("results/AF/AF_{species}.tsv.gz", species=SPECIES),
+
+        expand(
+            "results/AF/private_fixed_{species}_Kythira.tsv.gz",
+            species=SPECIES,
+        ),
+
+        # Genome-wide heterozygosity / inbreeding summaries
+        expand(
+            "results/heterozygosity_genome/{species}_" + SNP_SUFFIX + ".het",
+            species=SPECIES,
+        ),
+
+        # PLINK input files
+        expand(
+            "input_files/plink/{species}_" + SNP_SUFFIX + ".bed",
+            species=SPECIES,
+        ),
+
+        # PCA
+        expand(
+            "results/pca/{species}_" + SNP_SUFFIX + ".pca.maf{maf}.eigenvec",
+            species=SPECIES,
+            maf=MAF,
+        ),
+        expand(
+            "results/pca/{species}_" + SNP_SUFFIX + ".pca.maf{maf}.eigenval",
+            species=SPECIES,
+            maf=MAF,
+        ),
+
+        # ADMIXTURE
+        expand(
+            "results/admixture/admixture_{species}_" + SNP_SUFFIX + ".clusters{cluster}.out",
+            species=SPECIES,
+            cluster=CLUSTERS,
+        ),
+
+        # Crete-only ADMIXTURE
+       
+        expand(
+            "results/admixture/{species}_CRETEONLY_admixture{cluster}.done",
+            species=SPECIES, cluster=CRETEONLY_CLUSTERS,
+        ),
+
+        # Pairwise genetic distance matrices
+        expand(
+            "results/distance/{species}_" + SNP_SUFFIX + "_maf{maf}.distance_matrix.dist",
+            species=SPECIES,
+            maf=MAF,
+        ),
+
+        # popgenWindows and dA
+        expand(
+            "results/popgenwindows/{species}_" + ALLSITES_SUFFIX +
+            ".w60000.m100.s30000.Fst.Dxy.pi.dA.csv.gz",
+            species=SPECIES,
+        ),
+
+        # Tajima's D
+        expand(
+            "results/TajimasD/{species}_" + ALLSITES_SUFFIX +
+            ".w60000.m100.s30000.D.tsv.gz",
+            species=SPECIES,
+        ),
+
+        # Window-based NJ/ASTRAL trees
+        expand(
+            "results/astral/ASTRAL.{species}.60000.30000.diploid.tre",
+            species=SPECIES,
+        ),
+
+        "input_files/ASTRAL.orientalisNNEMadesignored.60000.30000.diploid_woSupport.tre",
+        "input_files/ASTRAL.hofrichteri.60000.30000.diploid_woSupport.tre",
+
+        # Dsuite / Fbranch
+        "results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.txt",
+        "results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.png",
+        "results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.svg",
+
+        "results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.txt",
+        "results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.png",
+        "results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.svg",
+
+###############################################################################
+# 1. Genome-wide VCF preparation
+###############################################################################
+
+rule merge_chrom_snp_vcfs:
+    input:
+        vcfs=expand(
+            VCF_DIR + "/{{species}}_" + SNP_SUFFIX + ".chr{chrom}.vcf.gz",
+            chrom=CHROMOSOMES,
+        )
+    output:
+        final_vcf="input_files/{species}_" + SNP_SUFFIX + ".vcf.gz"
+    threads: 1
+    shell:
+        r"""
+        mkdir -p input_files
+        bcftools concat -Oz {input.vcfs} > {output.final_vcf}
+        bcftools index -f --tbi {output.final_vcf}
+        """
+
+
+rule merge_chrom_allsites_vcfs:
+    input:
+        vcfs=expand(
+            VCF_DIR + "/{{species}}_" + ALLSITES_SUFFIX + ".chr{chrom}.vcf.gz",
+            chrom=CHROMOSOMES,
+        )
+    output:
+        final_vcf="input_files/{species}_" + ALLSITES_SUFFIX + ".vcf.gz"
+    threads: 1
+    shell:
+        r"""
+        mkdir -p input_files
+        bcftools concat -Oz {input.vcfs} > {output.final_vcf}
+        bcftools index -f --tbi {output.final_vcf}
+        """
+
+
+rule merge_chrom_variant_vcfs:
+    input:
+        vcfs=expand(
+            VCF_DIR + "/{{species}}_" + VARIANT_SUFFIX + ".chr{chrom}.vcf.gz",
+            chrom=CHROMOSOMES,
+        )
+    output:
+        final_vcf="input_files/{species}_" + VARIANT_SUFFIX + ".vcf.gz"
+    threads: 1
+    shell:
+        r"""
+        mkdir -p input_files
+        bcftools concat -Oz {input.vcfs} > {output.final_vcf}
+        bcftools index -f --tbi {output.final_vcf}
+        """
+
+###############################################################################
+# 2. Allele frequencies
+###############################################################################
+
+rule filter_biallelic_snps_indels:
+    input:
+        "input_files/{species}_" + VARIANT_SUFFIX + ".vcf.gz"
+    output:
+        "input_files/{species}_" + SNP_INDEL_SUFFIX + ".vcf.gz"
+    threads: 1
+    shell:
+        r"""
+        bcftools view \
+          -m2 -M2 \
+          -v snps,indels \
+          -O z \
+          -o {output} \
+          {input}
+
+        bcftools index -f --tbi {output}
+        """
+
+rule snpEff:
+    input:
+        "input_files/{species}_" + SNP_INDEL_SUFFIX + ".vcf.gz"
+    output:
+        "input_files/{species}_" + SNP_INDEL_SUFFIX + ".annSNPEFF.vcf.gz"
+    threads: 1
+    params:
+        db="fGouWil2.1.99",
+        report="input_files/{species}_" + SNP_INDEL_SUFFIX + ".annSNPEFF.html",
+        tmp="input_files/{species}_" + SNP_INDEL_SUFFIX + ".annSNPEFF.vcf.tmp",
+    shell:
+        r"""
+        java -jar bin/snpEff/snpEff.jar \
+          -v {params.db} \
+          -stats {params.report} \
+          {input} > {params.tmp}
+
+        bcftools view -I {params.tmp} -O z -o {output}
+        bcftools index -f --tbi {output}
+        rm -f {params.tmp}
+        """
+
+
+rule population_AF_variants:
+    input:
+        vcf = "input_files/{species}_" + SNP_INDEL_SUFFIX + ".annSNPEFF.vcf.gz",
+        popinfo=lambda wc: pop_af_info(wc.species),
+    output:
+        "results/AF/AF_{species}.tsv.gz"
+    threads: 1
+    run:
+        cmd = (
+            f"bcftools +fill-tags {input.vcf} -Ou -- -S {input.popinfo} -t AF "
+            "| bcftools view -h"
+        )
+        header = subprocess.check_output(cmd, shell=True, text=True)
+        pops = re.findall(r"ID=(AF_[^,]+)", header)
+
+        header_line = "CHROM\tPOS\tREF\tALT\tANN" + "".join([f"\t{p}" for p in pops])
+        spec_AF = "".join([f"\t%INFO/{p}" for p in pops])
+
+        shell(
+            f"""
+            mkdir -p results/AF
+            (
+              echo -e '{header_line}'
+              bcftools +fill-tags {input.vcf} -Ou -- -S {input.popinfo} -t AF \
+                | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/ANN{spec_AF}\n'
+            ) | bgzip -c > {output}
+            """
+        )
+
+
+rule private_fixed_sites:
+    input:
+        af="results/AF/AF_{species}.tsv.gz"
+    output:
+        "results/AF/private_fixed_{species}_{focal_pop}.tsv.gz"
+    params:
+        threshold=0.95,
+        pops=["Kythira", "NNE_Mades", "NW_Petres", "SE_Vatos", "SW_Plakias"],
+        exclude=[]
+    run:
+        import pandas as pd
+        import os
+
+        os.makedirs("results/private_fixed", exist_ok=True)
+
+        df = pd.read_csv(input.af, sep="\t", low_memory=False)
+
+        af_cols = [f"AF_{p}" for p in params.pops]
+        df[af_cols] = df[af_cols].apply(pd.to_numeric, errors="coerce")
+
+        other_pops = [
+            p for p in params.pops
+            if p != wildcards.focal_pop and p not in params.exclude
+        ]
+
+        other_cols = [f"AF_{p}" for p in other_pops]
+
+        case1 = (
+            (df[f"AF_{wildcards.focal_pop}"] >= params.threshold) &
+            df[other_cols].le(1 - params.threshold).all(axis=1)
+        )
+
+        case2 = (
+            (df[f"AF_{wildcards.focal_pop}"] <= 1 - params.threshold) &
+            df[other_cols].ge(params.threshold).all(axis=1)
+        )
+
+        fixed = df[case1 | case2].copy()
+
+        if "ANN" in fixed.columns:
+            first_ann = fixed["ANN"].astype(str).str.split(",", n=1).str[0]
+            ann_split = first_ann.str.split("|", expand=True)
+
+            fixed["EFFECT"] = ann_split[1]
+            fixed["GENE_RAW"] = ann_split[3]
+
+        final_cols = [
+            "CHROM", "POS", "REF", "ALT",
+            "EFFECT", "GENE_RAW"
+        ] + af_cols
+
+        fixed[final_cols].to_csv(
+            output[0],
+            sep="\t",
+            index=False,
+            compression="gzip"
+        )
+
+###############################################################################
+# 3. PLINK, PCA, ADMIXTURE, distances
+###############################################################################
+
+rule genome_wide_het:
+    input:
+        vcf="input_files/{species}_" + SNP_SUFFIX + ".vcf.gz"
+    output:
+        "results/heterozygosity_genome/{species}_" + SNP_SUFFIX + ".het"
+    threads: 1
+    params:
+        out="results/heterozygosity_genome/{species}_" + SNP_SUFFIX
+    shell:
+        r"""
+        mkdir -p results/heterozygosity_genome
+        vcftools --gzvcf {input.vcf} --het --out {params.out}
+        """
+
+
+rule make_plink:
+    input:
+        vcf="input_files/{species}_" + SNP_SUFFIX + ".vcf.gz"
+    output:
+        bed="input_files/plink/{species}_" + SNP_SUFFIX + ".bed",
+        freq="input_files/plink/{species}_" + SNP_SUFFIX + ".frq",
+        check="input_files/plink/{species}_make_plink.done",
+    threads: 1
+    params:
+        out="input_files/plink/{species}_" + SNP_SUFFIX,
+        awk='{$1="0";print $0}',
+    shell:
+        r"""
+        mkdir -p input_files/plink
+        plink --vcf {input.vcf} --make-bed --freq --double-id \
+          --out {params.out} --allow-extra-chr
+
+        awk '{params.awk}' {params.out}.bim > {params.out}.bim.tmp
+        mv {params.out}.bim.tmp {params.out}.bim
+        touch {output.check}
+        """
+
+
+rule pca:
+    input:
+        bed="input_files/plink/{species}_" + SNP_SUFFIX + ".bed",
+        freq="input_files/plink/{species}_" + SNP_SUFFIX + ".frq",
+    output:
+        vec="results/pca/{species}_" + SNP_SUFFIX + ".pca.maf{maf}.eigenvec",
+        val="results/pca/{species}_" + SNP_SUFFIX + ".pca.maf{maf}.eigenval",
+        checkpoint="results/pca/{species}.maf{maf}.pca.done",
+    threads: 4
+    resources:
+        mem_gb=16,
+        walltime=1,
+    params:
+        mem=lambda wildcards, resources: str(int(resources["mem_gb"] * 900)),
+        input_base=lambda wildcards, input: os.path.splitext(input["bed"])[0],
+        output_base=lambda wildcards, output: os.path.splitext(output["vec"])[0],
+        maf_flag=lambda wildcards: f"--maf {wildcards.maf}" if float(wildcards.maf) else "",
+    shell:
+        r"""
+        mkdir -p results/pca
+        plink2 --threads {threads} --memory {params.mem} \
+          --set-missing-var-ids @:# \
+          --read-freq {input.freq} \
+          --chr-set 24 'no-x' 'no-y' 'no-xy' 'no-mt' \
+          {params.maf_flag} \
+          --bfile {params.input_base} \
+          --pca \
+          -out {params.output_base}
+
+        touch {output.checkpoint}
+        """
+
+
+rule admixture:
+    input:
+        bed="input_files/plink/{species}_" + SNP_SUFFIX + ".bed"
+    output:
+        "results/admixture/admixture_{species}_" + SNP_SUFFIX + ".clusters{cluster}.out"
+    threads: 8
+    resources:
+        walltime=12,
+        mem_mb=18000,
+    params:
+        out="admixture_{species}_" + SNP_SUFFIX + ".clusters{cluster}.out"
+    shell:
+        r"""
+        mkdir -p results/admixture
+        cd results/admixture
+        ../../bin/admixture_linux-1.3.0/admixture \
+          --cv ../../{input.bed} -j{threads} \
+          {wildcards.cluster} > {params.out}
+        cd ../../
+        """
+
+rule create_vcf_subset_CreteOnly:
+    """
+    Remove Kythira samples from the genome-wide SNP VCF.
+    """
+    input:
+        "input_files/{species}_" + SNP_SUFFIX + ".vcf.gz"
+    output:
+        vcf="input_files/{species}_" + SNP_SUFFIX + "_CRETEONLY.vcf.gz",
+        tbi="input_files/{species}_" + SNP_SUFFIX + "_CRETEONLY.vcf.gz.tbi"
+    params:
+        samples="input_files/pop_info/{species}_kythira_samples.txt"
+    threads: 1
+    shell:
+        r"""
+        bcftools view \
+          --samples-file ^{params.samples} \
+          -Oz \
+          -o {output.vcf} \
+          {input}
+
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule make_plink_CRETEONLY:
+    """
+    Convert Crete-only SNP VCF to PLINK format for ADMIXTURE.
+    """
+    input:
+        vcf="input_files/{species}_" + SNP_SUFFIX + "_CRETEONLY.vcf.gz",
+        tbi="input_files/{species}_" + SNP_SUFFIX + "_CRETEONLY.vcf.gz.tbi"
+    output:
+        bed="results/admixture/{species}_CRETEONLY.bed",
+        bim="results/admixture/{species}_CRETEONLY.bim",
+        fam="results/admixture/{species}_CRETEONLY.fam",
+        done="results/admixture/{species}_CRETEONLY_make_plink.done"
+    params:
+        prefix="results/admixture/{species}_CRETEONLY",
+        awk='{$1="0";print $0}'
+    threads: 1
+    resources:
+        mem_gb=8,
+        walltime=1
+    shell:
+        r"""
+        mkdir -p results/admixture
+
+        plink \
+          --vcf {input.vcf} \
+          --make-bed \
+          --double-id \
+          --out {params.prefix} \
+          --allow-extra-chr
+
+        awk '{params.awk}' {output.bim} > {output.bim}.tmp
+        mv {output.bim}.tmp {output.bim}
+
+        touch {output.done}
+        """
+
+
+rule admixture_CRETEONLY:
+    """
+    Run ADMIXTURE for Crete-only samples only.
+    """
+    input:
+        bed="results/admixture/{species}_CRETEONLY.bed",
+        bim="results/admixture/{species}_CRETEONLY.bim",
+        fam="results/admixture/{species}_CRETEONLY.fam",
+        done="results/admixture/{species}_CRETEONLY_make_plink.done"
+    output:
+        done="results/admixture/{species}_CRETEONLY_admixture{cluster}.done",
+        q="results/admixture/{species}_CRETEONLY.{cluster}.Q",
+        p="results/admixture/{species}_CRETEONLY.{cluster}.P",
+        log="results/admixture/{species}_CRETEONLY.K{cluster}.log"
+    params:
+        prefix="{species}_CRETEONLY"
+    threads: 8
+    resources:
+        mem_mb=18000,
+        walltime=12
+    shell:
+        r"""
+        cd results/admixture
+
+        ../../bin/admixture_linux-1.3.0/admixture \
+          --cv \
+          -j{threads} \
+          {params.prefix}.bed \
+          {wildcards.cluster} \
+          > {wildcards.species}_CRETEONLY.K{wildcards.cluster}.log
+
+        touch ../../{output.done}
+        """
+
+rule distance:
+    input:
+        vcf="input_files/{species}_" + SNP_SUFFIX + ".vcf.gz"
+    output:
+        dist="results/distance/{species}_" + SNP_SUFFIX + "_maf{maf}.distance_matrix.dist"
+    threads: 4
+    resources:
+        mem_gb=16,
+        walltime=1,
+    params:
+        mem=lambda wildcards, resources: str(int(resources["mem_gb"] * 900)),
+        output_base=lambda wildcards, output: os.path.splitext(output["dist"])[0],
+        maf_flag=lambda wildcards: f"--maf {wildcards.maf}" if float(wildcards.maf) else "",
+    shell:
+        r"""
+        mkdir -p results/distance
+        plink --double-id --threads {threads} --memory {params.mem} \
+          {params.maf_flag} \
+          --allow-extra-chr \
+          --vcf {input.vcf} \
+          --out {params.output_base} \
+          --distance square
+        """
+
+
+###############################################################################
+# 4. Outgroup VCFs for Dsuite / trees
+###############################################################################
+
+rule add_outgroup_orientalis:
+    input:
+        vcf_orientalis=VCF_DIR + "/orientalis_" + SNP_SUFFIX + ".chr{chrom}.vcf.gz",
+        vcf_hofrichteri=VCF_DIR + "/hofrichteri_" + SNP_SUFFIX + ".chr{chrom}.vcf.gz",
+    output:
+        "input_files/outgroup/orientalis/orientalis_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz"
+    threads: 1
+    params:
+        tmp="input_files/outgroup/orientalis_outgroup_{chrom}.vcf.gz",
+        samples=",".join(config["dsuite"]["orientalis_outgroup_samples"]),
+    shell:
+        r"""
+        mkdir -p input_files/outgroup/orientalis
+
+        bcftools view -s {params.samples} {input.vcf_hofrichteri} -Oz > {params.tmp}
+        bcftools index -f --tbi {params.tmp}
+
+        bcftools merge {params.tmp} {input.vcf_orientalis} -Oz > {output}
+
+        rm -f {params.tmp}*
+        bcftools index -f --tbi {output}
+        """
+
+
+rule add_outgroup_hofrichteri:
+    input:
+        vcf_orientalis=VCF_DIR + "/orientalis_" + SNP_SUFFIX + ".chr{chrom}.vcf.gz",
+        vcf_hofrichteri=VCF_DIR + "/hofrichteri_" + SNP_SUFFIX + ".chr{chrom}.vcf.gz",
+    output:
+        "input_files/outgroup/hofrichteri/hofrichteri_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz"
+    threads: 1
+    params:
+        tmp="input_files/outgroup/hofrichteri_outgroup_{chrom}.vcf.gz",
+        samples=",".join(config["dsuite"]["hofrichteri_outgroup_samples"]),
+    shell:
+        r"""
+        mkdir -p input_files/outgroup/hofrichteri
+
+        bcftools view -s {params.samples} {input.vcf_orientalis} -Oz > {params.tmp}
+        bcftools index -f --tbi {params.tmp}
+
+        bcftools merge {params.tmp} {input.vcf_hofrichteri} -Oz > {output}
+
+        rm -f {params.tmp}*
+        bcftools index -f --tbi {output}
+        """
+
+
+###############################################################################
+# 5. Sliding-window NJ trees and ASTRAL
+###############################################################################
+
+rule window_pwd:
+    input:
+        vcf="input_files/outgroup/{species}/{species}_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz"
+    output:
+        window_pwd="results/njtrees_hannes/window_pwd.{species}.chrom{chrom}.60000.30000.tsv"
+    threads: 1
+    resources:
+        walltime=72,
+        mem_gb=8,
+    params:
+        window=WINDOW_SIZE,
+        step=WINDOW_STEP,
+    run:
+        os.makedirs("results/njtrees_hannes", exist_ok=True)
+
+        with open(output.window_pwd, "w") as f:
+            chrom = wildcards.chrom
+            for start in range(0, int(chrom_length.loc[chrom]), params.step):
+                end = start + int(params.window)
+                d = dv.get_hap_pwd_arr(
+                    input.vcf,
+                    chrom=wildcards.chrom,
+                    start=start,
+                    end=end,
+                    samples=None,
+                    ancestral_sample=None,
+                )
+                np.savetxt(f, [d], fmt="%i", delimiter="\t")
+
+
+rule window_pwd_to_tree_file:
+    input:
+        vcf="input_files/outgroup/{species}/{species}_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz",
+        window_pwd="results/njtrees_hannes/window_pwd.{species}.chrom{chrom}.60000.30000.tsv",
+    output:
+        hap_tree_fn="results/njtrees_hannes/window_pwd.{species}.chrom{chrom}.60000.30000.haplotype.newick",
+        dip_tree_fn="results/njtrees_hannes/window_pwd.{species}.chrom{chrom}.60000.30000.diploid.newick",
+    threads: 1
+    resources:
+        walltime=12,
+        mem_mb=18000,
+    run:
+        samples = dv.get_samples(vcf_fn=input.vcf)
+
+        with open(input.window_pwd) as f, open(output.hap_tree_fn, "w") as fo, open(output.dip_tree_fn, "w") as fod:
+            for line in f.readlines():
+                pwd_arr = np.array(line.strip().split())
+
+                hap_pwd_df = dv.hap_pwd_to_df(pwd_arr, samples).fillna(0)
+                hap_pwd_df = hap_pwd_df.apply(pd.to_numeric, errors="coerce")
+
+                hap_samples = ["_".join([t[0], str(t[1])]) for t in hap_pwd_df.index]
+                tree_newick = dv.get_nj_tree_newick(hap_pwd_df.values, hap_samples)
+                fo.write(tree_newick + "\n")
+
+                dip_pwd_df = dv.hap_to_dip(hap_pwd_df)
+                dip_pwd_df = dip_pwd_df.apply(pd.to_numeric, errors="coerce")
+
+                tree_newick_dip = dv.get_nj_tree_newick(dip_pwd_df.values, dip_pwd_df.index.values)
+                fod.write(tree_newick_dip + "\n")
+
+
+rule astral_summary:
+    input:
+        trees=expand(
+            "results/njtrees_hannes/window_pwd.{{species}}.chrom{chrom}.60000.30000.diploid.newick",
+            chrom=CHROMOSOMES,
+        )
+    output:
+        "results/astral/ASTRAL.{species}.60000.30000.diploid.tre"
+    threads: 1
+    params:
+        tmp="results/astral/{species}.astral.trees.tmp",
+        clean_tmp="results/astral/{species}.astral.trees.clean.tmp",
+        log="results/astral/{species}.astral.tree.log",
+        pop_info="input_files/pop_info/astral_{species}.info",
+    shell:
+        r"""
+        mkdir -p results/astral
+
+        cat results/njtrees_hannes/*{wildcards.species}*.diploid.newick \
+          > {params.tmp}
+
+        grep -v '^$' {params.tmp} \
+          | grep ';$' \
+          | sed "s/'//g" \
+          > {params.clean_tmp}
+
+        java -jar bin/ASTRAL/Astral/astral.5.7.8.jar \
+          -i {params.clean_tmp} \
+          -o {output} \
+          -a {params.pop_info} \
+          2>{params.log}
+
+        rm -f {params.tmp} {params.clean_tmp}
+        """
+rule prepare_astral_tree_for_dsuite:
+    """
+    Prepare rooted, no-support ASTRAL trees for Dsuite/Fbranch.
+
+    For hofrichteri:
+      - root by Outgroup
+      - keep all populations
+
+    For orientalisNNEMadesignored:
+      - start from the full orientalis ASTRAL tree
+      - remove NNE-Mades
+      - root by Outgroup
+      - remove support labels
+    """
+    input:
+        tree=lambda wc: (
+            "results/astral/ASTRAL.orientalis.60000.30000.diploid.tre"
+            if wc.tree_id == "orientalisNNEMadesignored"
+            else f"results/astral/ASTRAL.{wc.tree_id}.60000.30000.diploid.tre"
+        )
+    output:
+        "input_files/ASTRAL.{tree_id}.60000.30000.diploid_woSupport.tre"
+    threads: 1
+    run:
+        from ete3 import Tree
+
+        tree = Tree(str(input.tree), format=1)
+
+        # For orientalis Dsuite/Fbranch, remove the single NNE-Mades population
+        # because it is excluded from the D-statistics analysis.
+        if wildcards.tree_id == "orientalisNNEMadesignored":
+            for leaf in list(tree.iter_leaves()):
+                if leaf.name == "NNE-Mades":
+                    leaf.delete()
+
+        # Root using the explicit Outgroup population.
+        if "Outgroup" in tree.get_leaf_names():
+            tree.set_outgroup(tree & "Outgroup")
+        else:
+            raise ValueError(f"No Outgroup leaf found in {input.tree}")
+
+        # Remove support/internal labels for Dsuite compatibility.
+        for node in tree.traverse():
+            if not node.is_leaf():
+                node.name = ""
+
+        tree.write(outfile=str(output), format=5)
+
+###############################################################################
+# 6. Dsuite Dtrios and Fbranch
+###############################################################################
+
+rule Dtrios_wo_NNEMades_for_orientalis:
+    input:
+        vcf="input_files/outgroup/orientalis/orientalis_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz",
+        pop_info="input_files/pop_info/orientalisNNEMadesignored_pop.info",
+        tree="input_files/ASTRAL.orientalisNNEMadesignored.60000.30000.diploid_woSupport.tre",
+    output:
+        check="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_chr{chrom}.checkpoint",
+        Dmin="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_chr{chrom}_Dmin.txt",
+    threads: 1
+    params:
+        out_prefix=os.getcwd() + "/results/Dtrios/CreteDtrios_orientalisNNEMadesignored_chr{chrom}",
+    shell:
+        r"""
+        mkdir -p results/Dtrios
+
+        bin/Dsuite/Build/Dsuite Dtrios \
+          -o {params.out_prefix} \
+          -t {input.tree} \
+          {input.vcf} \
+          {input.pop_info}
+
+        touch {output.check}
+        """
+
+
+rule DtriosCombine_wo_NNEMades_for_orientalis:
+    input:
+        dmins=expand(
+            "results/Dtrios/CreteDtrios_orientalisNNEMadesignored_chr{chrom}_Dmin.txt",
+            chrom=CHROMOSOMES,
+        ),
+        tree="input_files/ASTRAL.orientalisNNEMadesignored.60000.30000.diploid_woSupport.tre",
+    output:
+        check="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.checkpoint",
+        combined_tree="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_combined_tree.txt",
+    threads: 1
+    params:
+        in_prefix=expand(
+            os.getcwd() + "/results/Dtrios/CreteDtrios_orientalisNNEMadesignored_chr{chrom}",
+            chrom=CHROMOSOMES,
+        ),
+        out_prefix=os.getcwd() + "/results/Dtrios/CreteDtrios_orientalisNNEMadesignored",
+    shell:
+        r"""
+        bin/Dsuite/Build/Dsuite DtriosCombine \
+          -o {params.out_prefix} \
+          -t {input.tree} \
+          {params.in_prefix}
+
+        touch {output.check}
+        test -s {output.combined_tree}
+        """
+
+
+rule Fbranch_wo_NNEMades_for_orientalis:
+    input:
+        check="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.checkpoint",
+        treeresults="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_combined_tree.txt",
+        tree="input_files/ASTRAL.orientalisNNEMadesignored.60000.30000.diploid_woSupport.tre",
+    output:
+        "results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.txt"
+    threads: 1
+    shell:
+        r"""
+        bin/Dsuite/Build/Dsuite Fbranch {input.tree} {input.treeresults} > {output}
+        """
+
+
+rule plot_fbranch_wo_NNEMades_for_orientalis:
+    input:
+        tree="input_files/ASTRAL.orientalisNNEMadesignored.60000.30000.diploid_woSupport.tre",
+        fbranch="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.txt",
+    output:
+        png="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.png",
+        svg="results/Dtrios/CreteDtrios_orientalisNNEMadesignored_COMBINE.Fbranch.svg",
+    threads: 1
+    shell:
+        r"""
+        python bin/Dsuite/utils/dtools.py --outgroup Outgroup {input.fbranch} {input.tree}
+        mv fbranch.png {output.png}
+        mv fbranch.svg {output.svg}
+        """
+
+
+rule Dtrios_hofrichteri:
+    input:
+        vcf="input_files/outgroup/hofrichteri/hofrichteri_" + SNP_SUFFIX + ".chr{chrom}_outgroup.vcf.gz",
+        pop_info="input_files/pop_info/hofrichteri_pop.info",
+        tree="input_files/ASTRAL.hofrichteri.60000.30000.diploid_woSupport.tre",
+    output:
+        check="results/Dtrios/CreteDtrios_hofrichteri_chr{chrom}.checkpoint",
+        Dmin="results/Dtrios/CreteDtrios_hofrichteri_chr{chrom}_Dmin.txt",
+    threads: 1
+    params:
+        out_prefix=os.getcwd() + "/results/Dtrios/CreteDtrios_hofrichteri_chr{chrom}",
+    shell:
+        r"""
+        mkdir -p results/Dtrios
+
+        bin/Dsuite/Build/Dsuite Dtrios \
+          -o {params.out_prefix} \
+          -t {input.tree} \
+          {input.vcf} \
+          {input.pop_info}
+
+        touch {output.check}
+        """
+
+
+rule DtriosCombine_hofrichteri:
+    input:
+        dmins=expand(
+            "results/Dtrios/CreteDtrios_hofrichteri_chr{chrom}_Dmin.txt",
+            chrom=CHROMOSOMES,
+        ),
+        tree="input_files/ASTRAL.hofrichteri.60000.30000.diploid_woSupport.tre",
+    output:
+        check="results/Dtrios/CreteDtrios_hofrichteri_COMBINE.checkpoint",
+        combined_tree="results/Dtrios/CreteDtrios_hofrichteri_combined_tree.txt",
+    threads: 1
+    params:
+        in_prefix=expand(
+            os.getcwd() + "/results/Dtrios/CreteDtrios_hofrichteri_chr{chrom}",
+            chrom=CHROMOSOMES,
+        ),
+        out_prefix=os.getcwd() + "/results/Dtrios/CreteDtrios_hofrichteri",
+    shell:
+        r"""
+        bin/Dsuite/Build/Dsuite DtriosCombine \
+          -o {params.out_prefix} \
+          -t {input.tree} \
+          {params.in_prefix}
+
+        touch {output.check}
+        test -s {output.combined_tree}
+        """
+
+
+rule Fbranch_hofrichteri:
+    input:
+        check="results/Dtrios/CreteDtrios_hofrichteri_COMBINE.checkpoint",
+        treeresults="results/Dtrios/CreteDtrios_hofrichteri_combined_tree.txt",
+        tree="input_files/ASTRAL.hofrichteri.60000.30000.diploid_woSupport.tre",
+    output:
+        "results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.txt"
+    threads: 1
+    shell:
+        r"""
+        bin/Dsuite/Build/Dsuite Fbranch {input.tree} {input.treeresults} > {output}
+        """
+
+
+rule plot_fbranch_hofrichteri:
+    input:
+        tree="input_files/ASTRAL.hofrichteri.60000.30000.diploid_woSupport.tre",
+        fbranch="results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.txt",
+    output:
+        png="results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.png",
+        svg="results/Dtrios/Dtrios_hofrichteri_COMBINE.Fbranch.svg",
+    threads: 1
+    shell:
+        r"""
+        python bin/Dsuite/utils/dtools.py --outgroup Outgroup {input.fbranch} {input.tree}
+        mv fbranch.png {output.png}
+        mv fbranch.svg {output.svg}
+        """
+
+
+###############################################################################
+# 7. popgenWindows
+###############################################################################
+
+rule prep_VCF:
+    input:
+        VCF_DIR + "/{species}_" + ALLSITES_SUFFIX + ".chr{chrom}.vcf.gz"
+    output:
+        geno="input_files/geno/{species}_" + ALLSITES_SUFFIX + ".chr{chrom}.geno.gz"
+    threads: 1
+    shell:
+        r"""
+        mkdir -p input_files/geno
+
+        bin/genomics_general/VCF_processing/parseVCF.py \
+          -i {input} \
+          | bgzip > {output.geno}
+        """
+
+
+rule popgenWindows:
+    input:
+        geno="input_files/geno/{species}_" + ALLSITES_SUFFIX + ".chr{chrom}.geno.gz",
+        pop_info=lambda wc: pop_info(wc.species),
+    output:
+        "results/popgenwindows/{species}_" + ALLSITES_SUFFIX +
+        ".chr{chrom}.w60000.m100.s30000.Fst.Dxy.pi.csv.gz"
+    threads: 8
+    resources:
+        mem_gb=16,
+        walltime=2,
+    params:
+        populations=lambda wildcards: generate_population_string(wildcards),
+    shell:
+        r"""
+        mkdir -p results/popgenwindows
+
+        bin/genomics_general/popgenWindows.py \
+          -g {input.geno} \
+          -o {output} \
+          -f phased \
+          -w {WINDOW_SIZE} \
+          -m {WINDOW_MIN_SITES} \
+          -s {WINDOW_STEP} \
+          {params.populations} \
+          --popsFile {input.pop_info} \
+          -T {threads} \
+          --writeFailedWindows
+        """
+
+
+rule merge_popgenwindows:
+    input:
+        expand(
+            "results/popgenwindows/{{species}}_" + ALLSITES_SUFFIX +
+            ".chr{chrom}.w60000.m100.s30000.Fst.Dxy.pi.csv.gz",
+            chrom=CHROMOSOMES,
+        )
+    output:
+        "results/popgenwindows/{species}_" + ALLSITES_SUFFIX +
+        ".w60000.m100.s30000.Fst.Dxy.pi.dA.csv.gz"
+    threads: 1
+    params:
+        input_prefix="results/popgenwindows/{}_" + ALLSITES_SUFFIX +
+        ".chr{}.w60000.m100.s30000.Fst.Dxy.pi.csv.gz"
+    run:
+        chr1 = params.input_prefix.format(wildcards.species, "1")
+        df = pd.read_csv(chr1, compression="gzip")
+        reference_header = list(df.columns)
+
+        for ch in CHROMOSOMES:
+            if ch == "1":
+                continue
+
+            df1 = pd.read_csv(
+                params.input_prefix.format(wildcards.species, ch),
+                compression="gzip",
+            )
+
+            if set(reference_header) != set(df1.columns):
+                replace_dic = {}
+                for col in set(df1.columns) - set(reference_header):
+                    parts = col.split("_")
+                    if len(parts) == 3:
+                        entry, spec1, spec2 = parts
+                        replace_dic[col] = f"{entry}_{spec2}_{spec1}"
+                df1.rename(columns=replace_dic, inplace=True)
+
+            if set(reference_header) != set(df1.columns):
+                raise ValueError(f"Header mismatch after attempted repair for chromosome {ch}")
+
+            df = pd.concat([df, df1], axis=0)
+
+        dxy_cols = [col for col in df.columns if "dxy" in col]
+
+        for col in dxy_cols:
+            _, taxon1, taxon2 = col.split("_")
+            df[f"dA_{taxon1}_{taxon2}"] = (
+                df[col] - (df[f"pi_{taxon1}"] + df[f"pi_{taxon2}"]) / 2
+            )
+
+        os.makedirs("results/popgenwindows", exist_ok=True)
+        df.to_csv(str(output), sep="\t", compression="gzip", index=False)
+
+
+###############################################################################
+# 8. Tajima's D
+###############################################################################
+
+rule tajimas_d_windows_matrix:
+    input:
+        vcf="input_files/{species}_" + ALLSITES_SUFFIX + ".vcf.gz",
+        windows="results/popgenwindows/{species}_" + ALLSITES_SUFFIX +
+                ".w60000.m100.s30000.Fst.Dxy.pi.dA.csv.gz",
+        popmap=lambda wc: pop_af_info(wc.species),
+    output:
+        "results/TajimasD/{species}_" + ALLSITES_SUFFIX +
+        ".w60000.m100.s30000.D.tsv.gz"
+    threads: 1
+    params:
+        scaff_col="scaffold",
+        start_col="start",
+        end_col="end",
+        min_sites=100,
+        min_maf=0.0,
+        min_called_frac=0.6,
+    shell:
+        r"""
+        mkdir -p results/TajimasD
+
+        python bin/tajimas_d_matrix_from_popmap_v2.py \
+          --vcf "{input.vcf}" \
+          --windows "{input.windows}" \
+          --popmap "{input.popmap}" \
+          --scaffold-col "{params.scaff_col}" \
+          --start-col "{params.start_col}" \
+          --end-col "{params.end_col}" \
+          --min-sites {params.min_sites} \
+          --min-maf {params.min_maf} \
+          --min-called-frac {params.min_called_frac} \
+          --out "{output}"
+        """

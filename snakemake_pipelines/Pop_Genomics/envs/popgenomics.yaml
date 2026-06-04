@@ -1,0 +1,60 @@
+name: popgenomics
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  # core
+  - python=3.10
+  - pip
+  - pyyaml
+
+  # workflow
+  - snakemake
+
+  # scientific python
+  - numpy=1.26
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-allel
+  - scikit-bio
+  - pysam
+  - cython
+
+  # phylogenetics / tree handling
+  - ete3
+  - dendropy
+  - biopython
+  - networkx
+
+  # population genomics tools
+  - bcftools
+  - htslib
+  - samtools
+  - vcftools
+  - bedtools
+  - plink
+  - plink2
+  - tabix
+
+  # compression / parsing
+  - pigz
+  - gzip
+
+  # plotting / notebook compatibility
+  - seaborn
+  - jupyterlab
+
+  # useful utilities
+  - parallel
+  - wget
+  - curl
+
+  # optional but often needed by older scripts
+  - pybedtools
+  - statsmodels
+
+  # java tools
+  - openjdk=17
