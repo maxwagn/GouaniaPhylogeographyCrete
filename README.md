@@ -14,7 +14,7 @@ Code and analysis pipelines accompanying the manuscript:
 
 Raw sequencing data are available from ENA (accession numbers mentioned in the publicaton).
 
-Intermediate and processed data for local analysis are not included in this repository but are availbale under:
+Intermediate and processed data for local analysis are not included in this repository but are available under:
 https://doi.org/10.6084/m9.figshare.32686272
 
 ## Reproducibility
