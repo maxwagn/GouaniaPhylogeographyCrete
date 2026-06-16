@@ -12,13 +12,14 @@ Code and analysis pipelines accompanying the manuscript:
 
 ## Data availability
 
-Raw sequencing data are available from ENA (accession numbers to be added upon publication).
+Raw sequencing data are available from ENA (accession numbers mentioned in the publicaton).
 
-Intermediate and processed data are not included in this repository.
+Intermediate and processed data for local analysis are not included in this repository but are availbale under:
+<ADD FIGSHARE LINK>
 
 ## Reproducibility
 
-Analyses were performed using Snakemake and Python. Software versions are documented in the corresponding workflow and environment files.
+Analyses were performed using Snakemake and Python (Jupyter Notebooks). Software versions are documented in the corresponding workflow and environment files.
 
 ## Contact
 
